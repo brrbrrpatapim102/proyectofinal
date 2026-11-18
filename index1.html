@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Teachable Machine + Arduino | 6 LEDs</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@latest/dist/teachablemachine-image.min.js"></script>
+<style>
+body{background:#f1f4f9;font-family:Arial,sans-serif}.header{background:#172554;color:#fff;padding:24px;text-align:center}
+.main-card{border:0;border-radius:15px;box-shadow:0 4px 15px #00000012}.status{font-weight:700}
+#webcam-container canvas{width:100%;max-width:400px;border-radius:12px}
+.prediction{background:#f8fafc;border-radius:10px;padding:12px;margin-bottom:10px}
+.led{width:24px;height:24px;border-radius:50%;background:#555;display:inline-block;border:2px solid #333;vertical-align:middle}
+.led.on{background:#22c55e;box-shadow:0 0 12px #22c55e}
+.led-row{display:flex;align-items:center;justify-content:space-between;padding:9px 12px;background:#f8fafc;border-radius:9px;margin-bottom:7px}
+.small-note{font-size:.88rem}
+</style>
+</head>
+<body>
+<header class="header"><h1>🤖 Teachable Machine + Arduino</h1><p class="mb-0">Reconocimiento de 6 clases y control de 6 LEDs</p></header>
+<main class="container py-4">
+<div class="row g-4">
+<div class="col-lg-5">
+<div class="card main-card p-4">
+<h4>Conexión</h4>
+<p>Estado: <span id="connectionStatus" class="status text-danger">Desconectado</span></p>
+<div class="d-grid gap-2">
+<button id="connectBtn" class="btn btn-primary" onclick="connectArduino()">🔌 Conectar Arduino físico (USB)</button>
+<button id="disconnectBtn" class="btn btn-outline-danger" onclick="disconnectArduino()" disabled>Desconectar Arduino</button>
+<button id="virtualBtn" class="btn btn-outline-primary" onclick="toggleVirtual()">🖥️ Activar modo virtual</button>
+</div>
+<div class="alert alert-info mt-3 small-note mb-0">
+<strong>Físico:</strong> conecta la placa por USB y selecciónala en la ventana del navegador.<br>
+<strong>Virtual:</strong> simula los seis LEDs en esta página. No puede detectar automáticamente una placa dentro de Tinkercad; ese simulador está aislado del navegador.
+</div>
+<hr>
+<h4>Modelo de IA</h4>
+<div class="d-grid gap-2">
+<button id="startBtn" class="btn btn-success" onclick="startModel()">▶ Iniciar reconocimiento</button>
+<button id="stopBtn" class="btn btn-danger" onclick="stopModel()" disabled>■ Detener reconocimiento</button>
+</div>
+<p class="small-note text-muted mt-2 mb-0">Los archivos model.json, metadata.json y weights.bin deben estar junto a este HTML.</p>
+</div>
+</div>
+<div class="col-lg-7">
+<div class="card main-card p-4">
+<h4>Vista de cámara</h4>
+<div class="bg-dark rounded-3 d-flex justify-content-center align-items-center" style="min-height:280px;overflow:hidden">
+<div id="webcam-container" class="text-center"><span class="text-white">Cámara desconectada</span></div>
+</div>
+<hr><h5>Predicciones</h5><div id="label-container"><p class="text-muted">Esperando iniciar el modelo...</p></div>
+</div>
+</div>
+<div class="col-12">
+<div class="card main-card p-4">
+<div class="d-flex flex-wrap justify-content-between align-items-center gap-2"><h4 class="mb-0">Estado de los 6 LEDs</h4><span id="activeClass" class="badge text-bg-secondary">Sin detección</span></div>
+<p class="text-muted small mt-2">En modo físico, estos indicadores reflejan el comando enviado al Arduino. En modo virtual, representan la simulación en pantalla.</p>
+<div class="row g-2" id="ledPanel"></div>
+</div>
+</div>
+</div>
+<footer class="text-center text-muted mt-4 small">Proyecto educativo | Teachable Machine + Arduino</footer>
+</main>
+<script>
+const MODEL_URL="./model.json", METADATA_URL="./metadata.json";
+const CLASSES=["CUADERNO","MANZANA","MOUSE","AIRPODS","CALCULADORA","NADA"];
+const LED_PINS=[2,3,4,5,6,7];
+let model=null, webcam=null, running=false, loading=false, animationId=null;
+let serialPort=null, writer=null, virtualMode=false, lastCommand="";
+const $=id=>document.getElementById(id);
+
+function setConnection(message,color){$("connectionStatus").textContent=message;$("connectionStatus").className="status text-"+color;}
+function buildLedPanel(){
+  $("ledPanel").innerHTML="";
+  CLASSES.forEach((name,i)=>{
+    const col=document.createElement("div");col.className="col-md-4";
+    col.innerHTML=`<div class="led-row"><span><span id="led${i}" class="led"></span> <strong class="ms-2">${name}</strong></span><small id="pin${i}" class="text-muted">${virtualMode?"VIRTUAL":"Pin "+LED_PINS[i]}</small></div>`;
+    $("ledPanel").appendChild(col);
+  });
+}
+function showLeds(index){
+  CLASSES.forEach((_,i)=>$("led"+i).classList.toggle("on",i===index));
+  $("activeClass").textContent=index>=0?CLASSES[index]:"Sin detección";
+  $("activeClass").className="badge "+(index>=0?"text-bg-success":"text-bg-secondary");
+}
+buildLedPanel();
+
+async function connectArduino(){
+  if(!("serial" in navigator)){
+    alert("Este navegador no permite Web Serial. Usa Chrome o Edge en una página segura (localhost o HTTPS).");
+    return;
+  }
+  try{
+    serialPort=await navigator.serial.requestPort();
+    await serialPort.open({baudRate:9600});
+    writer=serialPort.writable.getWriter();
+    virtualMode=false;
+    $("virtualBtn").textContent="🖥️ Activar modo virtual";
+    $("virtualBtn").classList.remove("btn-primary");$("virtualBtn").classList.add("btn-outline-primary");
+    setConnection("Arduino físico conectado","success");
+    $("disconnectBtn").disabled=false;$("connectBtn").disabled=true;
+    buildLedPanel();showLeds(-1);
+    await sendToArduino("0");
+  }catch(err){
+    console.error(err);setConnection("No conectado","danger");
+    alert("No se pudo conectar: "+err.message);
+  }
+}
+async function disconnectArduino(){
+  try{
+    if(writer){await writer.write(new TextEncoder().encode("0\n"));writer.releaseLock();writer=null;}
+    if(serialPort){await serialPort.close();serialPort=null;}
+  }catch(e){console.warn(e);}
+  $("connectBtn").disabled=false;$("disconnectBtn").disabled=true;
+  setConnection(virtualMode?"Modo virtual activo":"Desconectado",virtualMode?"info":"danger");
+  showLeds(-1);
+}
+function toggleVirtual(){
+  if(serialPort){alert("Desconecta primero el Arduino físico para activar el modo virtual.");return;}
+  virtualMode=!virtualMode;
+  $("virtualBtn").textContent=virtualMode?"Desactivar modo virtual":"🖥️ Activar modo virtual";
+  $("virtualBtn").classList.toggle("btn-primary",virtualMode);
+  $("virtualBtn").classList.toggle("btn-outline-primary",!virtualMode);
+  setConnection(virtualMode?"Modo virtual activo":"Desconectado",virtualMode?"info":"danger");
+  buildLedPanel();showLeds(-1);
+}
+async function sendToArduino(command){
+  if(command===lastCommand)return;
+  lastCommand=command;
+  if(writer){
+    try{await writer.write(new TextEncoder().encode(command+"\n"));}
+    catch(err){console.error(err);setConnection("Error de comunicación","danger");}
+  }
+}
+function normalizeClass(name){return String(name).trim().normalize("NFD").replace(/[\u0300-\u036f]/g,"").toUpperCase();}
+function classIndex(name){
+  const n=normalizeClass(name);
+  return CLASSES.findIndex(c=>normalizeClass(c)===n);
+}
+async function applyPrediction(predictions){
+  let best=predictions.reduce((a,b)=>b.probability>a.probability?b:a);
+  // Evita cambios por predicciones débiles.
+  if(best.probability<0.60)return;
+  const index=classIndex(best.className);
+  if(index<0)return;
+  showLeds(index);
+  await sendToArduino(String(index+1));
+}
+async function startModel(){
+  if(running||loading)return;
+  loading=true;$("startBtn").disabled=true;$("startBtn").textContent="Cargando modelo...";
+  try{
+    if(!window.tmImage)throw new Error("No se cargó la librería de Teachable Machine.");
+    model=await tmImage.load(MODEL_URL,METADATA_URL);
+    const modelNames=model.getClassLabels().map(normalizeClass);
+    const missing=CLASSES.filter(c=>!modelNames.includes(normalizeClass(c)));
+    if(missing.length)console.warn("Clases esperadas no encontradas en metadata:",missing,"Clases del modelo:",model.getClassLabels());
+    webcam=new tmImage.Webcam(400,300,true);
+    await webcam.setup();await webcam.play();
+    $("webcam-container").innerHTML="";$("webcam-container").appendChild(webcam.canvas);
+    $("label-container").innerHTML="";
+    for(let i=0;i<model.getTotalClasses();i++){
+      const div=document.createElement("div");div.className="prediction";
+      div.innerHTML=`<div class="d-flex justify-content-between mb-2"><strong class="class-name"></strong><span class="percentage"></span></div><div class="progress"><div class="progress-bar bg-success" role="progressbar"></div></div>`;
+      $("label-container").appendChild(div);
+    }
+    running=true;$("stopBtn").disabled=false;$("startBtn").textContent="Reconocimiento activo";
+    loop();
+  }catch(err){
+    console.error(err);alert("No se pudo iniciar el modelo/cámara: "+err.message);
+    await cleanup();$("startBtn").disabled=false;$("startBtn").textContent="▶ Iniciar reconocimiento";
+  }finally{loading=false;}
+}
+async function loop(){
+  if(!running)return;
+  try{
+    webcam.update();
+    const predictions=await model.predict(webcam.canvas);
+    predictions.forEach((p,i)=>{
+      const el=$("label-container").children[i];if(!el)return;
+      const pct=(p.probability*100).toFixed(1);
+      el.querySelector(".class-name").textContent=p.className;
+      el.querySelector(".percentage").textContent=pct+"%";
+      el.querySelector(".progress-bar").style.width=pct+"%";
+    });
+    await applyPrediction(predictions);
+  }catch(err){console.error("Error de predicción:",err);stopModel();return;}
+  if(running)animationId=requestAnimationFrame(loop);
+}
+async function stopModel(){
+  running=false;if(animationId!==null){cancelAnimationFrame(animationId);animationId=null;}
+  await cleanup();showLeds(-1);lastCommand="";await sendToArduino("0");
+  $("webcam-container").innerHTML='<span class="text-white">Cámara desconectada</span>';
+  $("label-container").innerHTML='<p class="text-muted">Esperando iniciar el modelo...</p>';
+  $("startBtn").disabled=false;$("startBtn").textContent="▶ Iniciar reconocimiento";$("stopBtn").disabled=true;
+}
+async function cleanup(){
+  if(webcam){try{webcam.stop();}catch(e){console.warn(e);}webcam=null;}
+  if(model){try{model.model?.dispose();}catch(e){console.warn(e);}model=null;}
+}
+if("serial" in navigator){
+  navigator.serial.addEventListener("disconnect",async()=>{
+    if(writer){try{writer.releaseLock();}catch(e){}writer=null;}
+    serialPort=null;$("connectBtn").disabled=false;$("disconnectBtn").disabled=true;
+    setConnection(virtualMode?"Modo virtual activo":"Arduino desconectado",virtualMode?"info":"danger");
+    showLeds(-1);
+  });
+}
+</script>
+</body>
+</html>
